@@ -85,6 +85,20 @@ def update(filepath: str | None, update_all: bool):
     try:
         indexer = Indexer.load_existing()
 
+        if not update_all and not filepath:
+            click.echo("Please specify a file path or use --all", err=True)
+            sys.exit(1)
+
+        migration = indexer.migrate_missing_file_metadata()
+        if migration["migrated"]:
+            click.echo(f"Migrated metadata for {migration['migrated']} files")
+        if migration["errors"]:
+            click.echo(click.style(f"Warnings ({len(migration['errors'])}):", fg="yellow"))
+            for stale_path, error in migration["errors"][:5]:
+                click.echo(f"  - {stale_path}: {error}")
+            if len(migration["errors"]) > 5:
+                click.echo(f"  ... and {len(migration['errors']) - 5} more")
+
         if update_all:
             result = indexer.update_all_stale()
             click.echo(f"Updated {result['updated']} files")
@@ -92,15 +106,12 @@ def update(filepath: str | None, update_all: bool):
                 click.echo(click.style(f"Errors ({len(result['errors'])}):", fg="red"))
                 for filepath, error in result["errors"]:
                     click.echo(f"  - {filepath}: {error}")
-        elif filepath:
+        else:
             result = indexer.update_file(filepath)
             if result.get("removed"):
                 click.echo(f"Removed {filepath} from index")
             else:
                 click.echo(f"Updated {filepath} ({result['symbols_changed']} symbols changed)")
-        else:
-            click.echo("Please specify a file path or use --all", err=True)
-            sys.exit(1)
 
     except FileNotFoundError as e:
         click.echo(click.style(f"Error: {e}", fg="red"), err=True)

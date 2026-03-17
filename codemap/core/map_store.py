@@ -23,16 +23,23 @@ class FileEntry:
     language: str
     lines: int
     symbols: list[Symbol]
+    size: int | None = None
+    mtime_ns: int | None = None
 
     def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
-        return {
+        data = {
             "hash": self.hash,
             "indexed_at": self.indexed_at,
             "language": self.language,
             "lines": self.lines,
             "symbols": [s.to_dict() for s in self.symbols],
         }
+        if self.size is not None:
+            data["size"] = self.size
+        if self.mtime_ns is not None:
+            data["mtime_ns"] = self.mtime_ns
+        return data
 
     @classmethod
     def from_dict(cls, data: dict) -> "FileEntry":
@@ -43,6 +50,8 @@ class FileEntry:
             language=data["language"],
             lines=data["lines"],
             symbols=[Symbol.from_dict(s) for s in data.get("symbols", [])],
+            size=data.get("size"),
+            mtime_ns=data.get("mtime_ns"),
         )
 
 
@@ -130,6 +139,9 @@ class MapStore:
         self.codemap_dir = self.root / self.CODEMAP_DIR
         self._manifest: Optional[RootManifest] = None
         self._dir_maps: dict[str, DirectoryMap] = {}  # Cache for directory maps
+        self._dirty_dirs: set[str] = set()
+        self._manifest_dirty = False
+        self._tracked_dirs: set[str] | None = None
 
     @property
     def manifest(self) -> RootManifest:
@@ -137,6 +149,12 @@ class MapStore:
         if self._manifest is None:
             self._manifest = self._load_manifest()
         return self._manifest
+
+    def _get_tracked_dirs(self) -> set[str]:
+        """Get the tracked directories as a set for fast membership checks."""
+        if self._tracked_dirs is None:
+            self._tracked_dirs = set(self.manifest.directories)
+        return self._tracked_dirs
 
     @classmethod
     def load(cls, root: Path | None = None) -> "MapStore":
@@ -241,6 +259,7 @@ class MapStore:
         data = dir_map.to_dict()
         with open(map_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, sort_keys=True)
+        self._dirty_dirs.discard(directory)
 
     def save_manifest(self) -> None:
         """Save the root manifest."""
@@ -251,15 +270,18 @@ class MapStore:
         data = self.manifest.to_dict()
         with open(manifest_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, sort_keys=True)
+        self._manifest_dirty = False
 
     def save(self) -> None:
         """Save all modified directory maps and the manifest."""
-        # Save all cached directory maps
-        for directory in list(self._dir_maps.keys()):
+        if not self._dirty_dirs and not self._manifest_dirty:
+            return
+
+        for directory in sorted(self._dirty_dirs):
             self._save_dir_map(directory)
 
-        # Save manifest
-        self.save_manifest()
+        if self._manifest_dirty:
+            self.save_manifest()
 
     def update_file(
         self,
@@ -268,6 +290,8 @@ class MapStore:
         language: str,
         lines: int,
         symbols: list[Symbol],
+        size: int | None = None,
+        mtime_ns: int | None = None,
     ) -> None:
         """Update or add a file entry.
 
@@ -293,11 +317,17 @@ class MapStore:
             language=language,
             lines=lines,
             symbols=symbols,
+            size=size,
+            mtime_ns=mtime_ns,
         )
+        self._dirty_dirs.add(directory)
 
         # Ensure directory is in the manifest
-        if directory not in self.manifest.directories:
+        tracked_dirs = self._get_tracked_dirs()
+        if directory not in tracked_dirs:
             self.manifest.directories.append(directory)
+            tracked_dirs.add(directory)
+            self._manifest_dirty = True
 
     def remove_file(self, rel_path: str) -> bool:
         """Remove a file entry.
@@ -315,13 +345,18 @@ class MapStore:
         dir_map = self._load_dir_map(directory)
         if filename in dir_map.files:
             del dir_map.files[filename]
+            self._dirty_dirs.add(directory)
 
             # If directory is now empty, remove it from manifest and cache
             if not dir_map.files:
-                if directory in self.manifest.directories:
+                tracked_dirs = self._get_tracked_dirs()
+                if directory in tracked_dirs:
                     self.manifest.directories.remove(directory)
+                    tracked_dirs.remove(directory)
+                    self._manifest_dirty = True
                 if directory in self._dir_maps:
                     del self._dir_maps[directory]
+                self._dirty_dirs.discard(directory)
                 # Remove the empty directory's codemap file
                 map_path = self._get_dir_map_path(directory)
                 if map_path.exists():
@@ -350,6 +385,42 @@ class MapStore:
 
         dir_map = self._load_dir_map(directory)
         return dir_map.files.get(filename)
+
+    def update_file_metadata(
+        self,
+        rel_path: str,
+        *,
+        size: int | None = None,
+        mtime_ns: int | None = None,
+    ) -> bool:
+        """Update stored stat metadata for an indexed file.
+
+        Args:
+            rel_path: Relative path to the file.
+            size: File size in bytes.
+            mtime_ns: File modified time in nanoseconds.
+
+        Returns:
+            True if the entry changed, False otherwise.
+        """
+        entry = self.get_file(rel_path)
+        if entry is None:
+            return False
+
+        changed = False
+        if size is not None and entry.size != size:
+            entry.size = size
+            changed = True
+        if mtime_ns is not None and entry.mtime_ns != mtime_ns:
+            entry.mtime_ns = mtime_ns
+            changed = True
+
+        if changed:
+            path = Path(rel_path)
+            directory = str(path.parent) if path.parent != Path(".") else ""
+            self._dirty_dirs.add(directory)
+
+        return changed
 
     def get_file_hash(self, rel_path: str) -> Optional[str]:
         """Get the hash of a file.
@@ -560,6 +631,7 @@ class MapStore:
             "total_symbols": total_symbols,
             "last_full_index": datetime.now(timezone.utc).isoformat(),
         }
+        self._manifest_dirty = True
 
     def _count_symbols(self, symbols: list[Symbol] | None) -> int:
         """Count total symbols including children.
@@ -588,6 +660,7 @@ class MapStore:
         self.manifest.root = root
         self.manifest.config = config
         self.manifest.generated_at = datetime.now(timezone.utc).isoformat()
+        self._manifest_dirty = True
 
     def get_all_files(self) -> Iterator[tuple[str, FileEntry]]:
         """Iterate over all indexed files.
@@ -609,6 +682,9 @@ class MapStore:
             shutil.rmtree(self.codemap_dir)
         self._manifest = RootManifest()
         self._dir_maps.clear()
+        self._dirty_dirs.clear()
+        self._manifest_dirty = False
+        self._tracked_dirs = None
 
 
 # Legacy compatibility aliases

@@ -4,6 +4,8 @@ import json
 import pytest
 from pathlib import Path
 
+import codemap.core.indexer as indexer_module
+from codemap.core.hasher import hash_file
 from codemap.core.indexer import Indexer
 from codemap.core.map_store import MapStore
 
@@ -270,6 +272,81 @@ def broken(
         # Should handle gracefully
         assert result["total_files"] == 1
 
+    def test_index_all_avoids_extra_disk_reads(self, tmp_path: Path, monkeypatch):
+        test_file = tmp_path / "test.py"
+        test_file.write_text("def func(): pass")
+
+        def fail_read_text(*args, **kwargs):
+            raise AssertionError("index_all should not call Path.read_text")
+
+        def fail_hash_file(*args, **kwargs):
+            raise AssertionError("index_all should hash the already-read bytes")
+
+        monkeypatch.setattr(Path, "read_text", fail_read_text)
+        monkeypatch.setattr(indexer_module, "hash_file", fail_hash_file)
+
+        indexer = Indexer(root=tmp_path)
+        result = indexer.index_all()
+
+        assert result["total_files"] == 1
+
+    def test_validate_all_skips_hash_when_metadata_matches(self, tmp_path: Path, monkeypatch):
+        test_file = tmp_path / "test.py"
+        test_file.write_text("def func(): pass")
+
+        indexer = Indexer(root=tmp_path)
+        indexer.index_all()
+
+        def fail_hash_file(*args, **kwargs):
+            raise AssertionError("validate_all should not hash unchanged files")
+
+        monkeypatch.setattr(indexer_module, "hash_file", fail_hash_file)
+
+        assert indexer.validate_all() == []
+
+    def test_migrate_missing_file_metadata(self, tmp_path: Path):
+        test_file = tmp_path / "test.py"
+        test_file.write_text("def func(): pass")
+
+        store = MapStore(tmp_path)
+        store.set_metadata(str(tmp_path), {"languages": ["python"]})
+        store.update_file("test.py", hash_file(test_file), "python", 1, symbols=[])
+        store.update_stats()
+        store.save()
+
+        indexer = Indexer.load_existing(tmp_path)
+        result = indexer.migrate_missing_file_metadata()
+
+        assert result["migrated"] == 1
+
+        entry = MapStore.load(tmp_path).get_file("test.py")
+        assert entry is not None
+        assert entry.size == test_file.stat().st_size
+        assert entry.mtime_ns == test_file.stat().st_mtime_ns
+
+    def test_migrate_missing_file_metadata_skips_stale_files(self, tmp_path: Path):
+        test_file = tmp_path / "test.py"
+        test_file.write_text("def func(): pass")
+
+        store = MapStore(tmp_path)
+        store.set_metadata(str(tmp_path), {"languages": ["python"]})
+        store.update_file("test.py", "abc123def456", "python", 1, symbols=[])
+        store.update_stats()
+        store.save()
+
+        test_file.write_text("def modified(): pass")
+
+        indexer = Indexer.load_existing(tmp_path)
+        result = indexer.migrate_missing_file_metadata()
+
+        assert result["migrated"] == 0
+        assert result["stale"] == 1
+
+        entry = MapStore.load(tmp_path).get_file("test.py")
+        assert entry is not None
+        assert entry.size is None
+        assert entry.mtime_ns is None
+
     def test_update_all_stale(self, tmp_path: Path):
         (tmp_path / "file1.py").write_text("def f1(): pass")
         (tmp_path / "file2.py").write_text("def f2(): pass")
@@ -283,6 +360,31 @@ def broken(
 
         result = indexer.update_all_stale()
         assert result["updated"] == 2
+
+    def test_update_all_stale_saves_once(self, tmp_path: Path, monkeypatch):
+        (tmp_path / "file1.py").write_text("def f1(): pass")
+        (tmp_path / "file2.py").write_text("def f2(): pass")
+
+        indexer = Indexer(root=tmp_path)
+        indexer.index_all()
+
+        (tmp_path / "file1.py").write_text("def f1_modified(): pass")
+        (tmp_path / "file2.py").write_text("def f2_modified(): pass")
+
+        save_calls = 0
+        original_save = indexer.map_store.save
+
+        def counted_save():
+            nonlocal save_calls
+            save_calls += 1
+            return original_save()
+
+        monkeypatch.setattr(indexer.map_store, "save", counted_save)
+
+        result = indexer.update_all_stale()
+
+        assert result["updated"] == 2
+        assert save_calls == 1
 
     def test_reindex_clears_previous(self, tmp_path: Path):
         """Test that re-running index_all clears previous index."""

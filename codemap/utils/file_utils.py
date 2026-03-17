@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fnmatch
+import os
 from pathlib import Path
 from typing import Iterator
 
@@ -27,30 +28,30 @@ def discover_files(
     if config is None:
         config = Config()
 
-    # Determine extensions based on languages
-    extensions = _get_extensions_for_languages(languages or config.languages)
+    extensions = set(_get_extensions_for_languages(languages or config.languages))
 
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
+    for dirpath_str, dirnames, filenames in os.walk(root, topdown=True):
+        dirpath = Path(dirpath_str)
+        rel_dir = dirpath.relative_to(root)
+        rel_dir_str = "" if rel_dir == Path(".") else rel_dir.as_posix()
 
-        # Check extension
-        if not any(path.suffix == ext for ext in extensions):
-            continue
+        kept_dirs = []
+        for dirname in dirnames:
+            rel_child = dirname if not rel_dir_str else f"{rel_dir_str}/{dirname}"
+            if should_exclude(rel_child, config.exclude_patterns):
+                continue
+            kept_dirs.append(dirname)
+        dirnames[:] = kept_dirs
 
-        # Get relative path for pattern matching
-        try:
-            rel_path = path.relative_to(root)
-        except ValueError:
-            continue
+        for filename in filenames:
+            if Path(filename).suffix not in extensions:
+                continue
 
-        rel_str = str(rel_path)
+            rel_path = filename if not rel_dir_str else f"{rel_dir_str}/{filename}"
+            if should_exclude(rel_path, config.exclude_patterns):
+                continue
 
-        # Check exclude patterns
-        if should_exclude(rel_str, config.exclude_patterns):
-            continue
-
-        yield path
+            yield dirpath / filename
 
 
 def should_exclude(filepath: str, patterns: list[str] | None = None) -> bool:

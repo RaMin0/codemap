@@ -2,7 +2,8 @@
 
 import pytest
 from pathlib import Path
-from codemap.utils.file_utils import get_language, _get_extensions_for_languages
+from codemap.utils.config import Config
+from codemap.utils.file_utils import discover_files, get_language, _get_extensions_for_languages
 
 
 class TestLanguageDetection:
@@ -30,3 +31,13 @@ class TestLanguageDetection:
         expected = [".cs", ".dart", ".go", ".java", ".rs", ".sql"]
         for ext in expected:
             assert ext in extensions, f"{ext} not returned for its language"
+
+    def test_discover_files_skips_excluded_directories(self, tmp_path: Path):
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "main.py").write_text("def main(): pass")
+        (tmp_path / "node_modules").mkdir()
+        (tmp_path / "node_modules" / "ignored.py").write_text("def ignored(): pass")
+
+        files = list(discover_files(tmp_path, config=Config(languages=["python"])))
+
+        assert files == [tmp_path / "src" / "main.py"]

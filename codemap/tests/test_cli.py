@@ -166,6 +166,59 @@ def new_function():
         assert result.exit_code == 0
         assert "Updated 2 files" in result.output
 
+    def test_update_all_migrates_existing_metadata(self, runner, sample_project, monkeypatch):
+        monkeypatch.chdir(sample_project)
+        runner.invoke(cli, ["init", "."])
+
+        root_map_path = sample_project / ".codemap" / "_root.codemap.json"
+        with open(root_map_path, encoding="utf-8") as f:
+            data = json.load(f)
+
+        for entry in data["files"].values():
+            entry.pop("size", None)
+            entry.pop("mtime_ns", None)
+
+        with open(root_map_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+
+        result = runner.invoke(cli, ["update", "--all"])
+
+        assert result.exit_code == 0
+        assert "Migrated metadata for 2 files" in result.output
+        assert "Updated 0 files" in result.output
+
+        with open(root_map_path, encoding="utf-8") as f:
+            migrated = json.load(f)
+
+        for entry in migrated["files"].values():
+            assert "size" in entry
+            assert "mtime_ns" in entry
+
+    def test_update_all_migrates_unchanged_entries_but_updates_stale_files(
+        self, runner, sample_project, monkeypatch
+    ):
+        monkeypatch.chdir(sample_project)
+        runner.invoke(cli, ["init", "."])
+
+        root_map_path = sample_project / ".codemap" / "_root.codemap.json"
+        with open(root_map_path, encoding="utf-8") as f:
+            data = json.load(f)
+
+        for entry in data["files"].values():
+            entry.pop("size", None)
+            entry.pop("mtime_ns", None)
+
+        with open(root_map_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+
+        (sample_project / "main.py").write_text("def changed(): pass")
+
+        result = runner.invoke(cli, ["update", "--all"])
+
+        assert result.exit_code == 0
+        assert "Migrated metadata for 1 files" in result.output
+        assert "Updated 1 files" in result.output
+
     def test_version_flag(self, runner):
         result = runner.invoke(cli, ["--version"])
         assert result.exit_code == 0
