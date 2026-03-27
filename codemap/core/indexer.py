@@ -9,9 +9,9 @@ from typing import Optional
 from ..parsers.base import Parser, Symbol
 from ..parsers.python_parser import PythonParser
 from ..utils.config import Config, load_config
-from ..utils.file_utils import count_lines, discover_files, get_language
-from .hasher import hash_file
-from .map_store import MapStore
+from ..utils.file_utils import discover_files, get_language
+from .hasher import hash_content, hash_file
+from .map_store import FileEntry, MapStore
 
 logger = logging.getLogger(__name__)
 
@@ -250,12 +250,7 @@ class Indexer:
             logger.debug(f"No parser for language {language}")
             return []
 
-        # Read file content
-        try:
-            content = filepath.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            # Try with errors='replace' for non-UTF-8 files
-            content = filepath.read_text(encoding="utf-8", errors="replace")
+        content, file_hash, line_count, file_size, mtime_ns = self._read_file_data(filepath)
 
         # Parse symbols
         try:
@@ -273,13 +268,91 @@ class Indexer:
         # Update map store
         self.map_store.update_file(
             rel_path=rel_path,
-            hash=hash_file(filepath),
+            hash=file_hash,
             language=language,
-            lines=count_lines(filepath),
+            lines=line_count,
             symbols=symbols,
+            size=file_size,
+            mtime_ns=mtime_ns,
         )
 
         return symbols
+
+    def _read_file_data(self, filepath: Path) -> tuple[str, str, int, int, int]:
+        """Read file bytes once and derive the metadata needed for indexing."""
+        raw = filepath.read_bytes()
+        try:
+            content = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            content = raw.decode("utf-8", errors="replace")
+
+        stat = filepath.stat()
+        return (
+            content,
+            hash_content(raw),
+            self._count_lines_from_content(content),
+            stat.st_size,
+            stat.st_mtime_ns,
+        )
+
+    @staticmethod
+    def _count_lines_from_content(content: str) -> int:
+        """Count lines without re-reading the file from disk."""
+        if not content:
+            return 0
+        return content.count("\n") + (0 if content.endswith("\n") else 1)
+
+    @staticmethod
+    def _metadata_matches(entry: FileEntry, filepath: Path) -> bool:
+        """Check whether a file's stat metadata still matches the indexed entry."""
+        if entry.size is None or entry.mtime_ns is None:
+            return False
+
+        stat = filepath.stat()
+        return entry.size == stat.st_size and entry.mtime_ns == stat.st_mtime_ns
+
+    def migrate_missing_file_metadata(self) -> dict:
+        """Backfill stat metadata for indexed files created by older codemap versions."""
+        migrated = 0
+        missing = 0
+        stale = 0
+        errors = []
+
+        for rel_path, entry in self.map_store.get_all_files():
+            if entry.size is not None and entry.mtime_ns is not None:
+                continue
+
+            filepath = self.root / rel_path
+            if not filepath.exists():
+                missing += 1
+                continue
+
+            try:
+                current_hash = hash_file(filepath)
+                if current_hash != entry.hash:
+                    stale += 1
+                    continue
+
+                stat = filepath.stat()
+                if self.map_store.update_file_metadata(
+                    rel_path,
+                    size=stat.st_size,
+                    mtime_ns=stat.st_mtime_ns,
+                ):
+                    migrated += 1
+            except Exception as e:
+                logger.warning(f"Failed to migrate metadata for {filepath}: {e}")
+                errors.append((rel_path, str(e)))
+
+        if migrated:
+            self.map_store.save()
+
+        return {
+            "migrated": migrated,
+            "missing": missing,
+            "stale": stale,
+            "errors": errors,
+        }
 
     def _count_symbols(self, symbols: list[Symbol] | None) -> int:
         """Count total symbols including children.
@@ -298,7 +371,7 @@ class Indexer:
                 count += self._count_symbols(symbol.children)
         return count
 
-    def update_file(self, filepath: str | Path) -> dict:
+    def update_file(self, filepath: str | Path, *, persist: bool = True) -> dict:
         """Update index for a single file.
 
         Args:
@@ -317,8 +390,9 @@ class Indexer:
                 rel_path = str(filepath)
 
             removed = self.map_store.remove_file(rel_path)
-            self.map_store.update_stats()
-            self.map_store.save()
+            if persist:
+                self.map_store.update_stats()
+                self.map_store.save()
 
             return {
                 "removed": removed,
@@ -337,8 +411,9 @@ class Indexer:
             symbols = self._index_file(filepath)
             new_symbol_count = self._count_symbols(symbols)
 
-            self.map_store.update_stats()
-            self.map_store.save()
+            if persist:
+                self.map_store.update_stats()
+                self.map_store.save()
 
             return {
                 "removed": False,
@@ -360,10 +435,14 @@ class Indexer:
 
         for filepath in stale_files:
             try:
-                self.update_file(self.root / filepath)
+                self.update_file(self.root / filepath, persist=False)
                 updated += 1
             except Exception as e:
                 errors.append((filepath, str(e)))
+
+        if updated:
+            self.map_store.update_stats()
+            self.map_store.save()
 
         return {
             "updated": updated,
@@ -387,6 +466,8 @@ class Indexer:
                 continue
 
             try:
+                if self._metadata_matches(entry, filepath):
+                    continue
                 current_hash = hash_file(filepath)
                 if current_hash != entry.hash:
                     stale.append(rel_path)
@@ -420,6 +501,8 @@ class Indexer:
             return False
 
         try:
+            if self._metadata_matches(entry, full_path):
+                return True
             current_hash = hash_file(full_path)
             return current_hash == entry.hash
         except Exception:

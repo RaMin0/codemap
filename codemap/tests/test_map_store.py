@@ -59,6 +59,42 @@ class TestMapStore:
         assert len(entry.symbols) == 1
         assert entry.symbols[0].name == "MyClass"
 
+    def test_update_file_tracks_stat_metadata(self, tmp_path: Path):
+        store = MapStore(tmp_path)
+
+        store.update_file(
+            rel_path="module.py",
+            hash="hash123",
+            language="python",
+            lines=20,
+            symbols=[],
+            size=123,
+            mtime_ns=456,
+        )
+        store.save()
+
+        loaded = MapStore.load(tmp_path)
+        entry = loaded.get_file("module.py")
+
+        assert entry is not None
+        assert entry.size == 123
+        assert entry.mtime_ns == 456
+
+    def test_update_file_metadata_marks_entry_dirty(self, tmp_path: Path):
+        store = MapStore(tmp_path)
+        store.update_file("module.py", "hash123", "python", 20, symbols=[])
+        store.save()
+
+        loaded = MapStore.load(tmp_path)
+        changed = loaded.update_file_metadata("module.py", size=123, mtime_ns=456)
+        loaded.save()
+
+        assert changed is True
+        entry = MapStore.load(tmp_path).get_file("module.py")
+        assert entry is not None
+        assert entry.size == 123
+        assert entry.mtime_ns == 456
+
     def test_update_file_in_subdirectory(self, tmp_path: Path):
         store = MapStore(tmp_path)
 
@@ -274,6 +310,31 @@ class TestMapStore:
 
         assert not (tmp_path / ".codemap").exists()
         assert store.manifest.directories == []
+
+    def test_save_only_writes_dirty_directory_maps(self, tmp_path: Path, monkeypatch):
+        store = MapStore(tmp_path)
+        store.update_file("src/a.py", "h1", "python", 10, [])
+        store.update_file("lib/b.py", "h2", "python", 10, [])
+        store.save()
+
+        loaded = MapStore.load(tmp_path)
+        assert loaded.get_file("src/a.py") is not None
+        assert loaded.get_file("lib/b.py") is not None
+
+        loaded.update_file("src/a.py", "h3", "python", 12, [])
+
+        saved_dirs = []
+        original_save_dir_map = loaded._save_dir_map
+
+        def record_save(directory: str) -> None:
+            saved_dirs.append(directory)
+            original_save_dir_map(directory)
+
+        monkeypatch.setattr(loaded, "_save_dir_map", record_save)
+
+        loaded.save()
+
+        assert saved_dirs == ["src"]
 
     def test_directory_structure_mirrors_project(self, tmp_path: Path):
         """Test that .codemap mirrors the project structure."""
