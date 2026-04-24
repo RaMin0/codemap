@@ -96,6 +96,8 @@ Symbols:
 | `interface` | TypeScript interface |
 | `type` | TypeScript type alias |
 | `enum` | Enum declaration |
+| `module` | Ruby module |
+| `singleton_method` | Ruby singleton/class method |
 
 ## Index Structure
 
